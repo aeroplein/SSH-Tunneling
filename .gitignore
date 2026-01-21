@@ -1,0 +1,24 @@
+# --- Build Artifacts (Executables) ---
+# Specifically the binaries visible in your screenshot
+client
+server
+SSHClient
+SSHServer
+# Standard binary extensions
+*.exe
+*.out
+*.o
+
+# --- IDE Settings ---
+# Settings specific to your machine
+.vscode/
+
+# --- Test Data & Outputs ---
+# Do not commit images or temporary test files
+*.jpg
+*.png
+*.txt
+
+# --- Safety ---
+# NEVER commit credentials or secrets
+secret.txt
