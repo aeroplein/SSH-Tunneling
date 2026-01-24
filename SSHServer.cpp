@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <chrono>
+#include <cmath>
 
 #include "DiffieHellman.hpp"
 #include "CryptoManager.hpp"
@@ -22,11 +24,15 @@ const char* TARGET_IP = "127.0.0.1";
 const int TARGET_PORT = 9999;
 
 class SSHServer {
-    int server_fd;
+    int server_fd; //file descriptor
+    //linux/unix os'lerde her şey bir dosyadır. 
+    //internet bağlantısı socket de bir dosyadır.
+    //os açtığımız her şeye bir sıra numarası id verir.
+    //server_fd=3 dediysek os 3 numaralı dosya benim 8080 portunu dinleyen soketimizdir.
+    //oluşturduğumuz soketi daha sonra bind veya listen fonksiyonlarında çağırabilmek için bir id no ve server_fd değişkeninde tuttuk.
 
 public:
     SSHServer() : server_fd(-1) {}
-
 
     bool recv_all(int sock, void* buffer, size_t len) {
         size_t total = 0;
@@ -51,9 +57,14 @@ public:
     }
 
     void handle_client_session(int client_socket) {
-        std::cout << "[INFO] Client " << client_socket << " connected. Starting Handshake..." << std::endl;
+        std::cout << "[INFO] [Client " << client_socket << "] Connected. Starting Handshake..." << std::endl;
 
-   
+        // burada eksik olan istatik sayaçlarını ekledim.
+        auto start_time=std::chrono::high_resolution_clock::now();
+        long long total_signal_bytes=0; //bu payload
+        long long total_noise_bytes=0; //header+hmac+padding
+        long long total_throughput_bytes=0; // bu da bandwidth iöin toplam trafik
+
         DiffieHellman dh;
         uint64_t my_public_key = dh.get_public_key();
         uint64_t client_public_key = 0;
@@ -63,10 +74,8 @@ public:
             close(client_socket); return;
         }
         
-   
-        kex_header.type = kex_header.type; 
         if (kex_header.type != CMD_KEX) {
-            std::cerr << "[ERROR] Handshake failed: Expected CMD_KEX." << std::endl;
+            std::cerr << "[ERROR] [Client " << client_socket << "] Handshake failed: Expected CMD_KEX." << std::endl;
             close(client_socket); return;
         }
 
@@ -74,7 +83,6 @@ public:
             close(client_socket); return;
         }
 
-     
         PacketHeader my_header;
         my_header.magic_number = htonl(MAGIC_NUMBER);
         my_header.type = CMD_KEX;
@@ -86,28 +94,21 @@ public:
 
         uint64_t shared_secret = dh.compute_shared_secret(client_public_key);
         
-    
         auto crypto = std::make_unique<CryptoManager>(shared_secret);
 
-        std::cout << "[DEBUG] Shared Secret Established." << std::endl;
+        std::cout << "[DEBUG] [Client " << client_socket << "] Shared Secret Established." << std::endl;
 
-    
         PacketHeader iv_header;
         if (!recv_all(client_socket, &iv_header, sizeof(iv_header))) {
             close(client_socket); return;
         }
 
         if (iv_header.type != CMD_IV) {
-            std::cerr << "[ERROR] Handshake failed: Expected CMD_IV." << std::endl;
+            std::cerr << "[ERROR] [Client " << client_socket << "] Handshake failed: Expected CMD_IV." << std::endl;
             close(client_socket); return;
         }
 
         uint32_t iv_len = ntohl(iv_header.payload_size);
-        if (iv_len != 16) {
-             std::cerr << "[ERROR] Invalid IV length." << std::endl;
-             close(client_socket); return;
-        }
-
         std::vector<char> iv_buffer(iv_len);
         if (!recv_all(client_socket, iv_buffer.data(), iv_len)) {
             close(client_socket); return;
@@ -116,22 +117,23 @@ public:
         std::string iv_str(iv_buffer.begin(), iv_buffer.end());
         crypto->set_iv(iv_str);
         
-        std::cout << "[SUCCESS] Secure Tunnel Established! IV Set." << std::endl;
+        std::cout << "[SUCCESS] [Client " << client_socket << "] Secure Tunnel Established! IV Set." << std::endl;
 
-     
         int target_fd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in target_addr;
         target_addr.sin_family = AF_INET;
         target_addr.sin_port = htons(TARGET_PORT);
         inet_pton(AF_INET, TARGET_IP, &target_addr.sin_addr);
 
+        bool tunnel_active = false;
         if (connect(target_fd, (struct sockaddr*)&target_addr, sizeof(target_addr)) < 0) {
-            std::cerr << "[ERROR] Failed to connect to target." << std::endl;
+            std::cerr << "[WARN] [Client " << client_socket << "] Target ("<< TARGET_PORT <<") unreachable. Tunneling disabled, File Transfer Active." << std::endl;
             close(target_fd);
-            close(client_socket);
-            return;
+            target_fd = -1;
+        } else {
+            std::cout << "[INFO] [Client " << client_socket << "] Tunnel Connected to Target." << std::endl;
+            tunnel_active = true;
         }
-        std::cout << "[INFO] Connected to Target (example.com:80)" << std::endl;
 
         std::string filename = "received_" + std::to_string(client_socket) + ".dat";
         std::ofstream outfile;
@@ -142,56 +144,65 @@ public:
         while (true) {
             FD_ZERO(&readfds);
             FD_SET(client_socket, &readfds);
-            FD_SET(target_fd, &readfds);
-            int max_sd = std::max(client_socket, target_fd);
+            if (tunnel_active) FD_SET(target_fd, &readfds);
+            
+            int max_sd = (tunnel_active) ? std::max(client_socket, target_fd) : client_socket;
 
             if (select(max_sd + 1, &readfds, NULL, NULL, NULL) < 0) break;
 
-         
+            //burası clienttan gelen veriyi alıyor
             if (FD_ISSET(client_socket, &readfds)) {
                 PacketHeader header;
                 if (!recv_all(client_socket, &header, sizeof(header))) break;
 
+                //snr hesabı için header'ı da bir gürültü olarak sayarız. (overhead)
+                total_noise_bytes+=sizeof(header);
+                total_throughput_bytes+=sizeof(header);
+                
                 header.magic_number = ntohl(header.magic_number);
                 header.payload_size = ntohl(header.payload_size);
+                uint8_t type = header.type;
 
-                if (header.magic_number != MAGIC_NUMBER) {
-                    std::cerr << "[ERROR] Invalid Protocol Header." << std::endl;
-                    break;
-                }
-                if (header.type == CMD_CLOSE) {
-                    std::cout << "[INFO] Client requested disconnect." << std::endl;
+                if (header.magic_number != MAGIC_NUMBER) break;
+                if (type == CMD_CLOSE) {
+                    std::cout << "[INFO] [Client " << client_socket << "] Client requested disconnect." << std::endl;
                     break;
                 }
                 
-                
-                if (header.payload_size > BUFFER_SIZE + 1024) break;
-
                 std::vector<char> body(header.payload_size);
                 if (!recv_all(client_socket, body.data(), header.payload_size)) break;
 
+                total_throughput_bytes += header.payload_size;
+
                 Packet encrypted_packet(body.begin(), body.end());
 
-                
                 std::string received_hmac((char*)header.hmac, 32);
                 if (!crypto->verify_hmac(encrypted_packet, received_hmac)) {
-                    std::cerr << "[SECURITY] HMAC mismatch. Dropping." << std::endl;
+                    std::cerr << "[SECURITY] [Client " << client_socket << "] HMAC mismatch. Dropping." << std::endl;
                     continue;
                 }
 
                 Packet decrypted_packet = crypto->decrypt(encrypted_packet);
 
-                if (header.type == CMD_TUNNEL_DATA) {
-                    send_all(target_fd, decrypted_packet.data(), decrypted_packet.size());
-                    
-                } else if (header.type == CMD_FILENAME) {
+                total_signal_bytes += decrypted_packet.size();
+                total_noise_bytes += (encrypted_packet.size() - decrypted_packet.size());
+                
+                if (type == CMD_TUNNEL_DATA) {
+                    if (tunnel_active) {
+                        send_all(target_fd, decrypted_packet.data(), decrypted_packet.size());
+                    }
+                } 
+                else if (type == CMD_FILENAME) {
                     std::string received_name(decrypted_packet.begin(), decrypted_packet.end());
+                    size_t slash = received_name.find_last_of("/\\");
+                    if (slash != std::string::npos) received_name = received_name.substr(slash + 1);
+
                     filename = "received_" + received_name;
                     outfile.open(filename, std::ios::binary);
                     file_open = true;
-                    std::cout << "[FILE] Receiving: " << filename << std::endl;
+                    std::cout << "[FILE] [Client " << client_socket << "] Receiving: " << filename << std::endl;
 
-                } else if (header.type == CMD_DATA) {
+                } else if (type == CMD_DATA) {
                     if (!file_open) {
                         outfile.open(filename, std::ios::binary);
                         file_open = true;
@@ -200,13 +211,14 @@ public:
                 }
             }
 
-            if (FD_ISSET(target_fd, &readfds)) {
+            //burası tagrettan gelen verimiz asıl tunneling kısmı
+            if (tunnel_active && FD_ISSET(target_fd, &readfds)) {
                 int valread = read(target_fd, buffer, BUFFER_SIZE);
-                if (valread <= 0) {
-                    break; 
-                }
+                if (valread <= 0) break; 
 
                 Packet raw_response(buffer, valread);
+                total_signal_bytes += raw_response.size();
+
                 Packet encrypted_response = crypto->encrypt(raw_response);
 
                 PacketHeader resp_header;
@@ -214,18 +226,46 @@ public:
                 resp_header.type = CMD_TUNNEL_DATA;
                 resp_header.payload_size = htonl((uint32_t)encrypted_response.size());
                 
-              
                 std::string hmac = crypto->compute_hmac(encrypted_response);
                 memcpy(resp_header.hmac, hmac.data(), 32);
 
                 send_all(client_socket, &resp_header, sizeof(resp_header));
                 send_all(client_socket, encrypted_response.data(), encrypted_response.size());
+
+                total_noise_bytes += sizeof(resp_header);
+                total_noise_bytes += (encrypted_response.size() - raw_response.size());
+                total_throughput_bytes += sizeof(resp_header) + encrypted_response.size();
             }
         }
 
         if(outfile.is_open()) outfile.close();
-        close(target_fd);
+        if(tunnel_active) close(target_fd);
         close(client_socket);
+        std::cout << "[INFO] [Client " << client_socket << "] Session Ended." << std::endl;
+
+        auto end_time=std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> duration=end_time-start_time;
+        double time_sec=duration.count();
+        if(time_sec<=0) time_sec=0.001;
+
+        double bandwidth_mbps= (total_throughput_bytes*8.0)/(time_sec*1000000.0);
+
+        if(total_noise_bytes==0) total_noise_bytes=1;
+        double snr_ratio=(double)total_signal_bytes/(double)total_noise_bytes;
+        double snr_db=10*log10(snr_ratio);
+
+        std::cout << "\n==========================================" << std::endl;
+        std::cout << "           SESSION PERFORMANCE REPORT     " << std::endl;
+        std::cout << "==========================================" << std::endl;
+        std::cout << " CLIENT ID     : " << client_socket << " (Multi-client Supported)" << std::endl;
+        std::cout << " DURATION      : " << std::fixed << std::setprecision(4) << time_sec << " s" << std::endl;
+        std::cout << " TOTAL DATA    : " << total_throughput_bytes << " bytes processed" << std::endl;
+        std::cout << " ------------------------------------------" << std::endl;
+        std::cout << " [METRIC] BANDWIDTH : " << std::fixed << std::setprecision(2) << bandwidth_mbps << " Mbps" << std::endl;
+        std::cout << " [METRIC] SNR       : " << snr_db << " dB" << std::endl;
+        std::cout << "          (Signal: " << total_signal_bytes << " B / Noise: " << total_noise_bytes << " B)" << std::endl;
+        std::cout << "==========================================\n" << std::endl;
+
         std::cout << "[INFO] Session Ended." << std::endl;
     }
 
@@ -254,7 +294,7 @@ public:
             exit(EXIT_FAILURE);
         }
 
-        std::cout << "SSH Secure Tunnel Server (Port: " << PORT << ")" << std::endl;
+        std::cout << "SSH Secure Tunnel Server (Hybrid Mode: Tunnel + File) - Port " << PORT << std::endl;
         std::cout << "[INFO] Waiting for connections..." << std::endl;
 
         while (true) {

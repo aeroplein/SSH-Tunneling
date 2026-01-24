@@ -1,24 +1,25 @@
 # --- Build Artifacts (Executables) ---
-# Specifically the binaries visible in your screenshot
 client
 server
+target_app
 SSHClient
 SSHServer
-# Standard binary extensions
 *.exe
 *.out
 *.o
 
-# --- IDE Settings ---
-# Settings specific to your machine
-.vscode/
-
-# --- Test Data & Outputs ---
-# Do not commit images or temporary test files
-*.jpg
-*.png
+# --- Logs & Output ---
+# Ignore all text logs from the test runs
 *.txt
+*.log
 
-# --- Safety ---
-# NEVER commit credentials or secrets
-secret.txt
+# --- IDE Settings ---
+.vscode/
+.idea/
+
+# --- Test Data & Artifacts ---
+# Explicitly KEEP JPEG images so the professor can run the test
+!*.jpg
+!*.jpeg
+# Ignore other media if necessary (optional)
+# *.png

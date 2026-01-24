@@ -1,40 +1,34 @@
 #include <iostream>
 #include <sys/socket.h>
-#include <sys/select.h> 
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <cstring>
+#include <fstream>
 #include <vector>
 #include <iomanip>
-#include <algorithm>
-#include <memory>     
+#include <cstring>
+#include <memory>
+#include <thread>
 
 #include "DiffieHellman.hpp"
 #include "CryptoManager.hpp"
 #include "Protocol.hpp"
 
-const int REMOTE_PORT = 8080;
-const int LOCAL_PORT = 9090;
+const int PORT = 8080;
 const char* SERVER_IP = "127.0.0.1";
 const int BUFFER_SIZE = 4096;
 
 class SSHClient {
-private:
-    int ssh_socket_fd;
-    int local_listener_fd;
-   
-    std::unique_ptr<CryptoManager> crypto; 
+    int socket_fd;
+    std::unique_ptr<CryptoManager> crypto;
 
 public:
-    SSHClient() : ssh_socket_fd(-1), local_listener_fd(-1) {}
+    SSHClient() : socket_fd(-1) {}
 
     ~SSHClient() {
-        if (ssh_socket_fd != -1) close(ssh_socket_fd);
-        if (local_listener_fd != -1) close(local_listener_fd);
+        if (socket_fd != -1) close(socket_fd);
     }
 
-  
     bool recv_all(int sock, void* buffer, size_t len) {
         size_t total = 0;
         char* p = (char*)buffer;
@@ -46,7 +40,6 @@ public:
         return true;
     }
 
-  
     bool send_all(int sock, const void* buffer, size_t len) {
         size_t total = 0;
         const char* p = (const char*)buffer;
@@ -58,49 +51,49 @@ public:
         return true;
     }
 
-    bool connect_to_server() {
+    bool connect_and_handshake() {
         struct sockaddr_in server_address;
-        
-        if ((ssh_socket_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+
+        if ((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             perror("Socket creation failed");
             return false;
         }
 
         server_address.sin_family = AF_INET;
-        server_address.sin_port = htons(REMOTE_PORT);
+        server_address.sin_port = htons(PORT);
 
-        if (inet_pton(AF_INET, SERVER_IP, &server_address.sin_addr) <= 0) return false;
-        if (connect(ssh_socket_fd, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) return false;
+        if (inet_pton(AF_INET, SERVER_IP, &server_address.sin_addr) <= 0) {
+            perror("Invalid address");
+            return false;
+        }
+
+        if (connect(socket_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
+            perror("Connection failed");
+            return false;
+        }
 
         std::cout << "[INFO] Connected to Server. Performing Handshake..." << std::endl;
 
-    
         DiffieHellman dh;
-        uint64_t my_pub = dh.get_public_key();
-        uint64_t server_pub = 0;
-
+        uint64_t my_public_key = dh.get_public_key();
+        
         PacketHeader kex_header;
         kex_header.magic_number = htonl(MAGIC_NUMBER);
         kex_header.type = CMD_KEX;
-        kex_header.payload_size = htonl(sizeof(my_pub));
-        memset(kex_header.hmac, 0, 32); 
-        
-        if (!send_all(ssh_socket_fd, &kex_header, sizeof(kex_header))) return false;
-        if (!send_all(ssh_socket_fd, &my_pub, sizeof(my_pub))) return false;
+        kex_header.payload_size = htonl(sizeof(my_public_key));
+        memset(kex_header.hmac, 0, 32);
 
-        PacketHeader resp_header;
-        if (!recv_all(ssh_socket_fd, &resp_header, sizeof(resp_header))) return false;
-        
-       
-        if (ntohl(resp_header.magic_number) != MAGIC_NUMBER || resp_header.type != CMD_KEX) {
-             std::cerr << "Handshake Protocol Error" << std::endl;
-             return false;
-        }
+        if (!send_all(socket_fd, &kex_header, sizeof(kex_header))) return false;
+        if (!send_all(socket_fd, &my_public_key, sizeof(my_public_key))) return false;
 
-        if (!recv_all(ssh_socket_fd, &server_pub, sizeof(server_pub))) return false;
+        PacketHeader srv_header;
+        if (!recv_all(socket_fd, &srv_header, sizeof(srv_header))) return false;
 
-        uint64_t secret = dh.compute_shared_secret(server_pub);
-        crypto = std::make_unique<CryptoManager>(secret);
+        uint64_t server_public_key;
+        if (!recv_all(socket_fd, &server_public_key, sizeof(server_public_key))) return false;
+
+        uint64_t shared_secret = dh.compute_shared_secret(server_public_key);
+        crypto = std::make_unique<CryptoManager>(shared_secret);
 
         crypto->generate_random_iv();
         std::string iv_str = crypto->get_iv_as_string();
@@ -109,118 +102,128 @@ public:
         iv_header.magic_number = htonl(MAGIC_NUMBER);
         iv_header.type = CMD_IV;
         iv_header.payload_size = htonl(iv_str.size());
-        memset(iv_header.hmac, 0, 32); 
-
-        if (!send_all(ssh_socket_fd, &iv_header, sizeof(iv_header))) return false;
-        if (!send_all(ssh_socket_fd, iv_str.data(), iv_str.size())) return false;
+        
+        if (!send_all(socket_fd, &iv_header, sizeof(iv_header))) return false;
+        if (!send_all(socket_fd, iv_str.data(), iv_str.size())) return false;
 
         std::cout << "[SUCCESS] Handshake Complete. Secure Tunnel Established." << std::endl;
         return true;
     }
 
-    bool start_local_listener() {
-        struct sockaddr_in address;
-        int opt = 1;
+    void perform_tunnel_test() {
+        if (!crypto) return;
 
-        if ((local_listener_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) return false;
-        setsockopt(local_listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        std::string msg = "GET / HTTP/1.1 (Tunnel Test from Client " + std::to_string(getpid()) + ")";
+        
+        Packet enc = crypto->encrypt(msg);
+        std::string hmac = crypto->compute_hmac(enc);
 
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(LOCAL_PORT);
+        PacketHeader h;
+        h.magic_number = htonl(MAGIC_NUMBER);
+        h.type = CMD_TUNNEL_DATA;
+        h.payload_size = htonl(enc.size());
+        memcpy(h.hmac, hmac.data(), 32);
 
-        if (bind(local_listener_fd, (struct sockaddr*)&address, sizeof(address)) < 0) return false;
-        if (listen(local_listener_fd, 1) < 0) return false;
+        send_all(socket_fd, &h, sizeof(h));
+        send_all(socket_fd, enc.data(), enc.size());
+        
+        std::cout << "[TUNNEL] Request sent through tunnel: " << msg << std::endl;
 
-        std::cout << "[INFO] Listening for local apps on port " << LOCAL_PORT << "..." << std::endl;
-        return true;
-    }
-
-    void start_tunneling() {
-        int app_socket_fd;
-        struct sockaddr_in app_addr;
-        socklen_t addrlen = sizeof(app_addr);
-
-        std::cout << "[INFO] Waiting for local application connection..." << std::endl;
-        if ((app_socket_fd = accept(local_listener_fd, (struct sockaddr*)&app_addr, &addrlen)) < 0) return;
-        std::cout << "[INFO] Local App Connected. Tunnel Active." << std::endl;
-
-        fd_set readfds;
-        char buffer[BUFFER_SIZE]; 
-
-        while (true) {
-            FD_ZERO(&readfds);
-            FD_SET(app_socket_fd, &readfds);
-            FD_SET(ssh_socket_fd, &readfds);
-            int max_sd = std::max(app_socket_fd, ssh_socket_fd);
-
-            if (select(max_sd + 1, &readfds, NULL, NULL, NULL) < 0) break;
-
-       
-            if (FD_ISSET(app_socket_fd, &readfds)) {
-                int valread = read(app_socket_fd, buffer, BUFFER_SIZE);
-                if (valread <= 0) break; 
-
-                Packet raw(buffer, valread);
-                Packet enc = crypto->encrypt(raw);
+        PacketHeader resp_h;
+        if (recv_all(socket_fd, &resp_h, sizeof(resp_h))) {
+            resp_h.payload_size = ntohl(resp_h.payload_size);
+            if (resp_h.payload_size > 0 && resp_h.payload_size < BUFFER_SIZE * 10) {
+                std::vector<char> body(resp_h.payload_size);
+                recv_all(socket_fd, body.data(), resp_h.payload_size);
                 
-                PacketHeader head;
-                head.magic_number = htonl(MAGIC_NUMBER);
-                head.type = CMD_TUNNEL_DATA;
-                head.payload_size = htonl((uint32_t)enc.size());
+                Packet resp_enc(body.begin(), body.end());
+                Packet resp_dec = crypto->decrypt(resp_enc);
+                std::string response(resp_dec.begin(), resp_dec.end());
                 
-             
-                std::string hmac = crypto->compute_hmac(enc);
-                memcpy(head.hmac, hmac.data(), 32);
-
-                if (!send_all(ssh_socket_fd, &head, sizeof(head))) break;
-                if (!send_all(ssh_socket_fd, enc.data(), enc.size())) break;
-            }
-
-            if (FD_ISSET(ssh_socket_fd, &readfds)) {
-                PacketHeader head;
-                if (!recv_all(ssh_socket_fd, &head, sizeof(head))) break; 
-                
-                uint32_t p_size = ntohl(head.payload_size);
-                uint32_t magic = ntohl(head.magic_number);
-
-                if (magic != MAGIC_NUMBER) {
-                    std::cerr << "Protocol Error" << std::endl;
-                    break;
-                }
-                
-                if (p_size > BUFFER_SIZE + 1024) { 
-                    std::cerr << "Packet too large." << std::endl;
-                    break;
-                }
-
-                std::vector<char> body(p_size);
-                if (!recv_all(ssh_socket_fd, body.data(), p_size)) break;
-
-           
-                Packet enc(body.begin(), body.end());
-                std::string received_hmac((char*)head.hmac, 32);
-                
-                if (!crypto->verify_hmac(enc, received_hmac)) {
-                     std::cerr << "[SECURITY] HMAC Verification Failed! Dropping packet." << std::endl;
-                     continue;
-                }
-
-                Packet dec = crypto->decrypt(enc);
-                send_all(app_socket_fd, dec.data(), dec.size());
+                std::cout << "[TUNNEL] Response received from Target: " << response << std::endl;
             }
         }
-        close(app_socket_fd);
-        std::cout << "[INFO] Tunnel closed." << std::endl;
+    }
+
+    void send_file(const std::string& filename) {
+        if (!crypto) return;
+
+        std::ifstream file(filename, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            std::cerr << "ERROR: Could not open file '" << filename << "'" << std::endl;
+            return;
+        }
+        std::streamsize file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        if (file_size == 0) {
+            std::cerr << "ERROR: File is empty." << std::endl;
+            return;
+        }
+
+        std::cout << "[INFO] Sending file: " << filename << " (" << file_size << " bytes)" << std::endl;
+
+        std::string basename = filename.substr(filename.find_last_of("/\\") + 1);
+        Packet name_packet(basename.begin(), basename.end());
+        Packet encrypted_name = crypto->encrypt(name_packet);
+
+        PacketHeader name_header;
+        name_header.magic_number = htonl(MAGIC_NUMBER);
+        name_header.type = CMD_FILENAME;
+        name_header.payload_size = htonl(encrypted_name.size());
+        
+        std::string hmac_name = crypto->compute_hmac(encrypted_name);
+        memcpy(name_header.hmac, hmac_name.data(), 32);
+
+        if (!send_all(socket_fd, &name_header, sizeof(name_header))) return;
+        if (!send_all(socket_fd, encrypted_name.data(), encrypted_name.size())) return;
+
+        char buffer[BUFFER_SIZE];
+        while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+            size_t bytes_read = file.gcount();
+            if (bytes_read == 0) break;
+
+            Packet chunk(buffer, buffer + bytes_read);
+            Packet encrypted_chunk = crypto->encrypt(chunk);
+
+            PacketHeader header;
+            header.magic_number = htonl(MAGIC_NUMBER);
+            header.type = CMD_DATA;
+            header.payload_size = htonl(encrypted_chunk.size());
+
+            std::string hmac_data = crypto->compute_hmac(encrypted_chunk);
+            memcpy(header.hmac, hmac_data.data(), 32);
+
+            if (!send_all(socket_fd, &header, sizeof(header))) break;
+            if (!send_all(socket_fd, encrypted_chunk.data(), encrypted_chunk.size())) break;
+        }
+
+        std::cout << "[SUCCESS] File sent successfully." << std::endl;
+    }
+
+    void close_connection() {
+        PacketHeader h_close;
+        h_close.magic_number = htonl(MAGIC_NUMBER);
+        h_close.type = CMD_CLOSE;
+        h_close.payload_size = 0;
+        memset(h_close.hmac, 0, 32);
+        send_all(socket_fd, &h_close, sizeof(h_close));
+        close(socket_fd);
+        socket_fd = -1;
     }
 };
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <filename>" << std::endl;
+        return 1;
+    }
+
     SSHClient client;
-    if (client.connect_to_server()) {
-        if (client.start_local_listener()) {
-            client.start_tunneling();
-        }
+    if (client.connect_and_handshake()) {
+        client.perform_tunnel_test();
+        client.send_file(argv[1]);
+        client.close_connection();
     }
     return 0;
 }
